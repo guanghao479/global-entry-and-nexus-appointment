@@ -579,9 +579,19 @@ func TestDetectAppMode_MultiUser(t *testing.T) {
 }
 
 func TestGetAppointmentURL(t *testing.T) {
-	url := getAppointmentURL("5300")
+	// Test Global Entry URL
+	url := getAppointmentURL("Global Entry", "5300")
 	expected := "https://ttp.cbp.dhs.gov/schedulerapi/slots?orderBy=soonest&limit=1&locationId=5300&minimum=1"
 	assert.Equal(t, expected, url)
+
+	// Test NEXUS URL
+	nexusURL := getAppointmentURL("NEXUS", "5020")
+	expectedNexus := "https://ttp.cbp.dhs.gov/schedulerapi/slot-availability?locationId=5020"
+	assert.Equal(t, expectedNexus, nexusURL)
+
+	// Test default (empty service type should default to Global Entry)
+	defaultURL := getAppointmentURL("", "5300")
+	assert.Equal(t, expected, defaultURL)
 }
 
 func TestGetNotificationTitle(t *testing.T) {

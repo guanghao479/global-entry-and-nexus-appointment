@@ -130,7 +130,11 @@ func detectAppMode() (*AppMode, error) {
 }
 
 // getAppointmentURL returns the API URL for checking appointments
-func getAppointmentURL(locationID string) string {
+func getAppointmentURL(serviceType, locationID string) string {
+	if serviceType == "NEXUS" {
+		return fmt.Sprintf("https://ttp.cbp.dhs.gov/schedulerapi/slot-availability?locationId=%s", locationID)
+	}
+	// Default to Global Entry
 	return fmt.Sprintf("https://ttp.cbp.dhs.gov/schedulerapi/slots?orderBy=soonest&limit=1&locationId=%s&minimum=1", locationID)
 }
 
@@ -159,7 +163,7 @@ func (h *LambdaHandler) checkAvailabilityAndNotify(ctx context.Context, serviceT
 			apiURL = fmt.Sprintf(h.URL, location)
 		} else {
 			// Use real API URL
-			apiURL = getAppointmentURL(location)
+			apiURL = getAppointmentURL(serviceType, location)
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 		if err != nil {
