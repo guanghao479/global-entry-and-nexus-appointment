@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -40,10 +41,11 @@ type (
 
 	// PersonalConfig holds environment variables for personal mode
 	PersonalConfig struct {
-		ServiceType string `envconfig:"SERVICE_TYPE" default:"Global Entry"`
-		LocationID  string `envconfig:"LOCATION_ID" required:"true"`
-		NtfyTopic   string `envconfig:"NTFY_TOPIC" required:"true"`
-		NtfyServer  string `envconfig:"NTFY_SERVER" default:"https://ntfy.sh"`
+		ServiceType   string `envconfig:"SERVICE_TYPE" default:"Global Entry"`
+		LocationID    string `envconfig:"LOCATION_ID" required:"true"`
+		NtfyTopic     string `envconfig:"NTFY_TOPIC" required:"true"`
+		NtfyServer    string `envconfig:"NTFY_SERVER" default:"https://ntfy.sh"`
+		MinimumSlots  string `envconfig:"MINIMUM_SLOTS" default:"1"`
 	}
 
 	// AppMode represents the application mode and configuration
@@ -129,13 +131,34 @@ func detectAppMode() (*AppMode, error) {
 	}, nil
 }
 
+// parseMinimumSlots parses comma-separated minimum slots string into slice of ints
+func parseMinimumSlots(minimumSlots string) []int {
+	parts := strings.Split(minimumSlots, ",")
+	var result []int
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if val, err := strconv.Atoi(part); err == nil && val > 0 {
+			result = append(result, val)
+		}
+	}
+	if len(result) == 0 {
+		result = []int{1} // default to 1 if no valid values
+	}
+	return result
+}
+
 // getAppointmentURL returns the API URL for checking appointments
-func getAppointmentURL(serviceType, locationID string) string {
+func getAppointmentURL(serviceType, locationID string, minimum int) string {
 	if serviceType == "NEXUS" {
-		return fmt.Sprintf("https://ttp.cbp.dhs.gov/schedulerapi/slot-availability?locationId=%s", locationID)
+		if locationID == "" {
+			// Use asLocations endpoint for multiple locations
+			return fmt.Sprintf("https://ttp.cbp.dhs.gov/schedulerapi/slots/asLocations?minimum=%d&limit=5&serviceName=NEXUS", minimum)
+		}
+		// NEXUS uses the same slots endpoint as Global Entry
+		return fmt.Sprintf("https://ttp.cbp.dhs.gov/schedulerapi/slots?orderBy=soonest&limit=1&locationId=%s&minimum=%d", locationID, minimum)
 	}
 	// Default to Global Entry
-	return fmt.Sprintf("https://ttp.cbp.dhs.gov/schedulerapi/slots?orderBy=soonest&limit=1&locationId=%s&minimum=1", locationID)
+	return fmt.Sprintf("https://ttp.cbp.dhs.gov/schedulerapi/slots?orderBy=soonest&limit=1&locationId=%s&minimum=%d", locationID, minimum)
 }
 
 // getNotificationTitle returns service-specific notification title
@@ -155,6 +178,32 @@ func getExpirationMessage(serviceType string) string {
 
 // checkAvailabilityAndNotify checks appointment availability and notifies topics
 func (h *LambdaHandler) checkAvailabilityAndNotify(ctx context.Context, serviceType, location string, topics []string) error {
+	return h.checkAvailabilityAndNotifyWithMinimums(ctx, serviceType, location, topics, []int{1})
+}
+
+// checkAvailabilityAndNotifyWithMinimums checks appointment availability with multiple minimum values
+func (h *LambdaHandler) checkAvailabilityAndNotifyWithMinimums(ctx context.Context, serviceType, location string, topics []string, minimums []int) error {
+	var lastErr error
+	for _, minimum := range minimums {
+		found, err := h.checkSingleMinimum(ctx, serviceType, location, topics, minimum)
+		if err != nil {
+			slog.Error("Failed to check minimum", "minimum", minimum, "error", err)
+			lastErr = err
+			continue
+		}
+		if found {
+			return nil // Found appointments, no need to check other minimums
+		}
+	}
+	// If all minimums failed with errors, return the last error
+	if lastErr != nil {
+		return lastErr
+	}
+	return nil
+}
+
+// checkSingleMinimum checks availability for a single minimum value
+func (h *LambdaHandler) checkSingleMinimum(ctx context.Context, serviceType, location string, topics []string, minimum int) (bool, error) {
 	// Retry logic for API call
 	for attempt := 1; attempt <= 3; attempt++ {
 		var apiURL string
@@ -163,18 +212,18 @@ func (h *LambdaHandler) checkAvailabilityAndNotify(ctx context.Context, serviceT
 			apiURL = fmt.Sprintf(h.URL, location)
 		} else {
 			// Use real API URL
-			apiURL = getAppointmentURL(serviceType, location)
+			apiURL = getAppointmentURL(serviceType, location, minimum)
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 		if err != nil {
-			return fmt.Errorf("failed to create request: %v", err)
+			return false, fmt.Errorf("failed to create request: %v", err)
 		}
 
 		resp, err := h.HTTPClient.Do(req)
 		if err != nil {
-			slog.Warn("Failed to get appointment slots", "location", location, "attempt", attempt, "error", err)
+			slog.Warn("Failed to get appointment slots", "location", location, "minimum", minimum, "attempt", attempt, "error", err)
 			if attempt == 3 {
-				return fmt.Errorf("failed after %d attempts: %v", attempt, err)
+				return false, fmt.Errorf("failed after %d attempts: %v", attempt, err)
 			}
 			time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
 			continue
@@ -182,23 +231,23 @@ func (h *LambdaHandler) checkAvailabilityAndNotify(ctx context.Context, serviceT
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			slog.Warn("Non-OK status from API", "location", location, "status", resp.StatusCode)
-			return fmt.Errorf("API returned status %d", resp.StatusCode)
+			slog.Warn("Non-OK status from API", "location", location, "minimum", minimum, "status", resp.StatusCode)
+			return false, fmt.Errorf("API returned status %d", resp.StatusCode)
 		}
 
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
-			return fmt.Errorf("failed to read response body: %v", err)
+			return false, fmt.Errorf("failed to read response body: %v", err)
 		}
 
 		var appointments []Appointment
 		if err := json.Unmarshal(body, &appointments); err != nil {
-			return fmt.Errorf("failed to unmarshal response: %v", err)
+			return false, fmt.Errorf("failed to unmarshal response: %v", err)
 		}
 
 		if len(appointments) > 0 && appointments[0].Active {
 			for _, topic := range topics {
-				message := fmt.Sprintf("%s appointment available at %s on %s", serviceType, location, appointments[0].StartTimestamp)
+				message := fmt.Sprintf("%s appointment available at %s on %s (minimum %d slots)", serviceType, location, appointments[0].StartTimestamp, minimum)
 				payload := map[string]string{
 					"topic":   topic,
 					"message": message,
@@ -216,7 +265,7 @@ func (h *LambdaHandler) checkAvailabilityAndNotify(ctx context.Context, serviceT
 				for ntfyAttempt := 1; ntfyAttempt <= 3; ntfyAttempt++ {
 					ntfyReq, err := http.NewRequestWithContext(ctx, http.MethodPost, ntfyServer, bytes.NewBuffer(payloadBytes))
 					if err != nil {
-						return fmt.Errorf("failed to create ntfy request: %v", err)
+						return false, fmt.Errorf("failed to create ntfy request: %v", err)
 					}
 					ntfyReq.Header.Set("Content-Type", "application/json")
 
@@ -224,23 +273,24 @@ func (h *LambdaHandler) checkAvailabilityAndNotify(ctx context.Context, serviceT
 					if err != nil {
 						slog.Warn("Failed to send ntfy notification", "topic", topic, "attempt", ntfyAttempt, "error", err)
 						if ntfyAttempt == 3 {
-							return fmt.Errorf("failed to send ntfy notification after %d attempts: %v", ntfyAttempt, err)
+							return false, fmt.Errorf("failed to send ntfy notification after %d attempts: %v", ntfyAttempt, err)
 						}
 						time.Sleep(time.Duration(ntfyAttempt) * 100 * time.Millisecond)
 						continue
 					}
 					ntfyResp.Body.Close()
 					if ntfyResp.StatusCode == http.StatusOK {
-						slog.Info("Sent notification", "topic", topic, "location", location)
+						slog.Info("Sent notification", "topic", topic, "location", location, "minimum", minimum)
 						break
 					}
 					slog.Warn("Non-OK status from ntfy", "topic", topic, "status", ntfyResp.StatusCode)
 				}
 			}
+			return true, nil // Found and notified
 		}
-		return nil
+		return false, nil // No appointments found
 	}
-	return nil
+	return false, nil
 }
 
 // handleExpiringSubscriptions deletes subscriptions exactly 30 days old and notifies (multi-user mode only)
@@ -399,9 +449,10 @@ func (h *LambdaHandler) handleSubscription(ctx context.Context, coll *mongo.Coll
 func (h *LambdaHandler) handlePersonalMode(ctx context.Context) (events.APIGatewayV2HTTPResponse, error) {
 	config := h.Mode.PersonalConfig
 	topics := []string{config.NtfyTopic}
+	minimums := parseMinimumSlots(config.MinimumSlots)
 
-	if err := h.checkAvailabilityAndNotify(ctx, config.ServiceType, config.LocationID, topics); err != nil {
-		slog.Error("Failed to check availability in personal mode", "location", config.LocationID, "error", err)
+	if err := h.checkAvailabilityAndNotifyWithMinimums(ctx, config.ServiceType, config.LocationID, topics, minimums); err != nil {
+		slog.Error("Failed to check availability in personal mode", "location", config.LocationID, "minimums", minimums, "error", err)
 		return events.APIGatewayV2HTTPResponse{
 				StatusCode: 500,
 				Body:       `{"error": "failed to check availability"}`},

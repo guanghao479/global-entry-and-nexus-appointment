@@ -92,10 +92,11 @@ func setupPersonalTestHandler(t *testing.T) (*LambdaHandler, func()) {
 	mode := &AppMode{
 		IsPersonalMode: true,
 		PersonalConfig: &PersonalConfig{
-			ServiceType: "Global Entry",
-			LocationID:  "5300",
-			NtfyTopic:   "test-topic",
-			NtfyServer:  "http://localhost", // Will be overridden by httptest
+			ServiceType:  "Global Entry",
+			LocationID:   "5300",
+			NtfyTopic:    "test-topic",
+			NtfyServer:   "http://localhost", // Will be overridden by httptest
+			MinimumSlots: "1",
 		},
 	}
 	url := "http://localhost/%s"                // Will be overridden by httptest
@@ -473,6 +474,7 @@ func TestPersonalMode_NexusService(t *testing.T) {
 
 	// Update to NEXUS service
 	handler.Mode.PersonalConfig.ServiceType = "NEXUS"
+	handler.Mode.PersonalConfig.MinimumSlots = "2"
 
 	// Mock HTTP server for NEXUS API
 	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -542,17 +544,74 @@ func TestPersonalMode_RejectsAPIRequests(t *testing.T) {
 	assert.JSONEq(t, `{"error": "personal mode only handles scheduled events"}`, resp.Body)
 }
 
+func TestPersonalMode_MultipleMinimumSlots(t *testing.T) {
+	handler, cleanup := setupPersonalTestHandler(t)
+	defer cleanup()
+	ctx := context.Background()
+
+	// Set multiple minimum slots
+	handler.Mode.PersonalConfig.MinimumSlots = "1,2"
+
+	// Mock HTTP server using the existing template URL pattern
+	// We'll track the called URLs to verify behavior
+	apiCalls := []string{}
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		apiCalls = append(apiCalls, r.URL.String())
+		// Return appointments for the second call (should be minimum=2)
+		if len(apiCalls) == 2 {
+			json.NewEncoder(w).Encode([]Appointment{
+				{LocationID: 5300, StartTimestamp: "2025-05-04T10:00:00Z", Active: true},
+			})
+		} else {
+			// Return empty for first call
+			json.NewEncoder(w).Encode([]Appointment{})
+		}
+	}))
+	defer apiServer.Close()
+	handler.URL = apiServer.URL + "/%s"
+
+	// Mock ntfy server
+	ntfyCalls := 0
+	var notificationMessage string
+	ntfyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ntfyCalls++
+		var payload map[string]string
+		json.NewDecoder(r.Body).Decode(&payload)
+		notificationMessage = payload["message"]
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ntfyServer.Close()
+	handler.Mode.PersonalConfig.NtfyServer = ntfyServer.URL
+	handler.HTTPClient = &http.Client{Timeout: 2 * time.Second}
+
+	// Create CloudWatch event
+	event := events.CloudWatchEvent{Source: "aws.events"}
+	eventJSON, _ := json.Marshal(event)
+
+	// Invoke handler
+	resp, err := handler.HandleRequest(ctx, eventJSON)
+	assert.NoError(t, err)
+	assert.Equal(t, 200, resp.StatusCode)
+
+	// Should have checked minimum 1, found appointment at minimum 2, and stopped
+	assert.Equal(t, 2, len(apiCalls), "Should have checked minimum 1 and 2")
+	assert.Equal(t, 1, ntfyCalls, "Should have sent one notification")
+	assert.Contains(t, notificationMessage, "(minimum 2 slots)", "Notification should mention minimum 2")
+}
+
 func TestDetectAppMode_Personal(t *testing.T) {
 	// Set environment variables for personal mode
 	os.Setenv("PERSONAL_MODE", "true")
 	os.Setenv("SERVICE_TYPE", "NEXUS")
 	os.Setenv("LOCATION_ID", "1234")
 	os.Setenv("NTFY_TOPIC", "my-topic")
+	os.Setenv("MINIMUM_SLOTS", "1,2,3")
 	defer func() {
 		os.Unsetenv("PERSONAL_MODE")
 		os.Unsetenv("SERVICE_TYPE")
 		os.Unsetenv("LOCATION_ID")
 		os.Unsetenv("NTFY_TOPIC")
+		os.Unsetenv("MINIMUM_SLOTS")
 	}()
 
 	mode, err := detectAppMode()
@@ -562,6 +621,7 @@ func TestDetectAppMode_Personal(t *testing.T) {
 	assert.Equal(t, "1234", mode.PersonalConfig.LocationID)
 	assert.Equal(t, "my-topic", mode.PersonalConfig.NtfyTopic)
 	assert.Equal(t, "https://ntfy.sh", mode.PersonalConfig.NtfyServer)
+	assert.Equal(t, "1,2,3", mode.PersonalConfig.MinimumSlots)
 }
 
 func TestDetectAppMode_MultiUser(t *testing.T) {
@@ -580,23 +640,63 @@ func TestDetectAppMode_MultiUser(t *testing.T) {
 
 func TestGetAppointmentURL(t *testing.T) {
 	// Test Global Entry URL
-	url := getAppointmentURL("Global Entry", "5300")
+	url := getAppointmentURL("Global Entry", "5300", 1)
 	expected := "https://ttp.cbp.dhs.gov/schedulerapi/slots?orderBy=soonest&limit=1&locationId=5300&minimum=1"
 	assert.Equal(t, expected, url)
 
-	// Test NEXUS URL
-	nexusURL := getAppointmentURL("NEXUS", "5020")
-	expectedNexus := "https://ttp.cbp.dhs.gov/schedulerapi/slot-availability?locationId=5020"
+	// Test Global Entry URL with minimum 2
+	url2 := getAppointmentURL("Global Entry", "5300", 2)
+	expected2 := "https://ttp.cbp.dhs.gov/schedulerapi/slots?orderBy=soonest&limit=1&locationId=5300&minimum=2"
+	assert.Equal(t, expected2, url2)
+
+	// Test NEXUS URL with specific location
+	nexusURL := getAppointmentURL("NEXUS", "5020", 1)
+	expectedNexus := "https://ttp.cbp.dhs.gov/schedulerapi/slots?orderBy=soonest&limit=1&locationId=5020&minimum=1"
 	assert.Equal(t, expectedNexus, nexusURL)
 
+	// Test NEXUS asLocations URL (no specific location)
+	nexusAsLocationsURL := getAppointmentURL("NEXUS", "", 2)
+	expectedNexusAsLocations := "https://ttp.cbp.dhs.gov/schedulerapi/slots/asLocations?minimum=2&limit=5&serviceName=NEXUS"
+	assert.Equal(t, expectedNexusAsLocations, nexusAsLocationsURL)
+
 	// Test default (empty service type should default to Global Entry)
-	defaultURL := getAppointmentURL("", "5300")
+	defaultURL := getAppointmentURL("", "5300", 1)
 	assert.Equal(t, expected, defaultURL)
 }
 
 func TestGetNotificationTitle(t *testing.T) {
 	assert.Equal(t, "Global Entry Appointment Notification", getNotificationTitle("Global Entry"))
 	assert.Equal(t, "NEXUS Appointment Notification", getNotificationTitle("NEXUS"))
+}
+
+func TestParseMinimumSlots(t *testing.T) {
+	// Test single value
+	result := parseMinimumSlots("1")
+	assert.Equal(t, []int{1}, result)
+
+	// Test multiple values
+	result = parseMinimumSlots("1,2,3")
+	assert.Equal(t, []int{1, 2, 3}, result)
+
+	// Test with spaces
+	result = parseMinimumSlots("1, 2, 3")
+	assert.Equal(t, []int{1, 2, 3}, result)
+
+	// Test with invalid values
+	result = parseMinimumSlots("1,invalid,3")
+	assert.Equal(t, []int{1, 3}, result)
+
+	// Test with zero and negative values
+	result = parseMinimumSlots("0,-1,2")
+	assert.Equal(t, []int{2}, result)
+
+	// Test empty string
+	result = parseMinimumSlots("")
+	assert.Equal(t, []int{1}, result)
+
+	// Test invalid string
+	result = parseMinimumSlots("invalid")
+	assert.Equal(t, []int{1}, result)
 }
 
 func TestMain(m *testing.M) {
