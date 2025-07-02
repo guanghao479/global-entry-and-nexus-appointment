@@ -69,16 +69,27 @@ deploy-personal:
 	echo ""; \
 	read -p "Enter your Ntfy topic: " NTFY_TOPIC; \
 	echo ""; \
+	echo "🔢 Minimum slot configuration:"; \
+	echo "   Enter minimum slots to check (comma-separated)"; \
+	echo "   Examples: '1' (default), '1,2', '1,2,3'"; \
+	echo "   This checks for 1 OR 2 OR 3 minimum available slots"; \
+	echo ""; \
+	read -p "Enter minimum slots [1]: " MINIMUM_SLOTS; \
+	if [ -z "$$MINIMUM_SLOTS" ]; then \
+		MINIMUM_SLOTS="1"; \
+	fi; \
+	echo ""; \
 	echo "🔧 Deploying with:"; \
 	echo "   Service: $$SERVICE_TYPE"; \
 	echo "   Location: $$LOCATION_ID"; \
 	echo "   Topic: $$NTFY_TOPIC"; \
+	echo "   Minimum Slots: $$MINIMUM_SLOTS"; \
 	echo ""; \
 	read -p "Proceed with deployment? (y/N): " confirm; \
 	if [ "$$confirm" != "y" ] && [ "$$confirm" != "Y" ]; then \
 		echo "Deployment cancelled."; exit 1; \
 	fi; \
-	PERSONAL_MODE=true SERVICE_TYPE="$$SERVICE_TYPE" LOCATION_ID=$$LOCATION_ID NTFY_TOPIC=$$NTFY_TOPIC cdk deploy PersonalAppointmentStack
+	PERSONAL_MODE=true SERVICE_TYPE="$$SERVICE_TYPE" LOCATION_ID=$$LOCATION_ID NTFY_TOPIC=$$NTFY_TOPIC MINIMUM_SLOTS=$$MINIMUM_SLOTS cdk deploy PersonalAppointmentStack
 
 destroy-personal:
 	@echo "🗑️  Destroying personal appointment scanner..."
