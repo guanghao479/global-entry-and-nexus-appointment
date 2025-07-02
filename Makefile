@@ -54,12 +54,14 @@ deploy-personal:
 	esac; \
 	echo ""; \
 	echo "📍 Find your location ID:"; \
+	echo "   Option 1: Run 'make select-location' for interactive selection"; \
+	echo "   Option 2: Manual lookup:"; \
 	if [ "$$SERVICE_TYPE" = "Global Entry" ]; then \
-		echo "   Visit: https://ttp.cbp.dhs.gov/schedulerui/schedule-interview/location?lang=en&vo=true&returnUrl=ttp-external&service=GP"; \
+		echo "     Visit: https://ttp.cbp.dhs.gov/schedulerui/schedule-interview/location?lang=en&vo=true&returnUrl=ttp-external&service=GP"; \
 	else \
-		echo "   Visit: https://ttp.cbp.dhs.gov/schedulerui/schedule-interview/location?lang=en&vo=true&returnUrl=ttp-external&service=NH"; \
+		echo "     Visit: https://ttp.cbp.dhs.gov/schedulerui/schedule-interview/location?lang=en&vo=true&returnUrl=ttp-external&service=NH"; \
 	fi; \
-	echo "   Look at browser network tab for locationId parameter"; \
+	echo "     Look at browser network tab for locationId parameter"; \
 	echo ""; \
 	read -p "Enter your location ID (e.g., 5300): " LOCATION_ID; \
 	echo ""; \
@@ -100,10 +102,70 @@ destroy-personal:
 		echo "Destruction cancelled."; \
 	fi
 
+# Interactive location selection
+select-location:
+	@echo "🏢 Location Selection"
+	@echo "===================="
+	@echo ""
+	@echo "Select service type:"
+	@echo "1) Global Entry"
+	@echo "2) NEXUS"
+	@read -p "Enter choice (1 or 2): " choice; \
+	case $$choice in \
+		1) SERVICE_NAME="GlobalEntry" ;; \
+		2) SERVICE_NAME="NEXUS" ;; \
+		*) echo "Invalid choice. Exiting."; exit 1 ;; \
+	esac; \
+	echo ""; \
+	echo "📡 Fetching $$SERVICE_NAME locations..."; \
+	LOCATIONS=$$(curl -s "https://ttp.cbp.dhs.gov/schedulerapi/locations/?temporary=false&inviteOnly=false&operational=true&serviceName=$$SERVICE_NAME" \
+		-H 'accept: application/json, text/plain, */*' \
+		-H 'user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'); \
+	if [ $$? -ne 0 ] || [ -z "$$LOCATIONS" ]; then \
+		echo "❌ Failed to fetch locations. Please check your internet connection."; \
+		echo ""; \
+		echo "📍 Manual lookup instructions:"; \
+		if [ "$$SERVICE_NAME" = "GlobalEntry" ]; then \
+			echo "   Visit: https://ttp.cbp.dhs.gov/schedulerui/schedule-interview/location?lang=en&vo=true&returnUrl=ttp-external&service=GP"; \
+		else \
+			echo "   Visit: https://ttp.cbp.dhs.gov/schedulerui/schedule-interview/location?lang=en&vo=true&returnUrl=ttp-external&service=NH"; \
+		fi; \
+		echo "   Look at browser network tab for locationId parameter"; \
+		exit 1; \
+	fi; \
+	echo "$$LOCATIONS" | jq -r 'to_entries | map("\(.key + 1)) \(.value.shortName) - \(.value.name) (ID: \(.value.id))") | .[]' > /tmp/locations.txt; \
+	if [ $$? -ne 0 ]; then \
+		echo "❌ Failed to parse locations. jq is required for this feature."; \
+		echo "   Install jq: brew install jq (macOS) or apt-get install jq (Ubuntu)"; \
+		exit 1; \
+	fi; \
+	echo ""; \
+	echo "📍 Available locations:"; \
+	cat /tmp/locations.txt; \
+	echo ""; \
+	LOCATION_COUNT=$$(cat /tmp/locations.txt | wc -l | tr -d ' '); \
+	read -p "Enter location number (1-$$LOCATION_COUNT): " LOCATION_NUM; \
+	if ! [[ "$$LOCATION_NUM" =~ ^[0-9]+$$ ]] || [ "$$LOCATION_NUM" -lt 1 ] || [ "$$LOCATION_NUM" -gt "$$LOCATION_COUNT" ]; then \
+		echo "Invalid location number. Exiting."; exit 1; \
+	fi; \
+	SELECTED_LOCATION=$$(echo "$$LOCATIONS" | jq -r ".[$$((LOCATION_NUM - 1))]"); \
+	LOCATION_ID=$$(echo "$$SELECTED_LOCATION" | jq -r '.id'); \
+	LOCATION_NAME=$$(echo "$$SELECTED_LOCATION" | jq -r '.name'); \
+	echo ""; \
+	echo "✅ Selected: $$LOCATION_NAME (ID: $$LOCATION_ID)"; \
+	echo ""; \
+	echo "📋 Your location ID is: $$LOCATION_ID"; \
+	echo "   You can use this ID in your deployment configuration."; \
+	rm -f /tmp/locations.txt
+
 # Helper target to show location lookup instructions  
 location-help:
 	@echo "📍 How to find your location ID:"
 	@echo ""
+	@echo "Option 1 - Use interactive selection:"
+	@echo "   make select-location"
+	@echo ""
+	@echo "Option 2 - Manual lookup:"
 	@echo "Global Entry locations:"
 	@echo "   https://ttp.cbp.dhs.gov/schedulerui/schedule-interview/location?lang=en&vo=true&returnUrl=ttp-external&service=GP"
 	@echo ""
@@ -133,6 +195,7 @@ help:
 	@echo "Personal deployment:"
 	@echo "  deploy-personal - Interactive personal deployment setup"
 	@echo "  destroy-personal - Destroy personal stack"
+	@echo "  select-location - Interactive location selection from API"
 	@echo "  location-help   - Show how to find location IDs"
 	@echo ""
 	@echo "AWS:"
@@ -142,4 +205,4 @@ help:
 	@echo "Help:"
 	@echo "  help           - Show this help message"
 
-.PHONY: clean develop-clean develop invoke aws-login update-creds deploy destroy deploy-personal destroy-personal location-help help
+.PHONY: clean develop-clean develop invoke aws-login update-creds deploy destroy deploy-personal destroy-personal select-location location-help help
