@@ -98,4 +98,4 @@ make destroy
 
 ### 📄 License
 
-MIT © 2025 Arun
+MIT © 2025 Arun\n\n---\n\n## 🎯 Personal Mode (NEW!)\n\n**Deploy your own private scanner with NEXUS support!**\n\n```bash\nmake deploy-personal\n```\n\n✅ **$0-1/month** AWS cost  \n✅ **No database needed** - uses environment variables  \n✅ **Interactive setup** - guided configuration  \n✅ **Supports Global Entry & NEXUS**  \n✅ **Private deployment** - only you have access  \n\n[📖 Complete Personal Setup Guide](./docs/PERSONAL_SETUP.md) | [🔧 Troubleshooting](./docs/TROUBLESHOOTING.md)\n\n### Help Commands\n```bash\nmake help            # Show all available commands\nmake location-help   # Show how to find location IDs\n```

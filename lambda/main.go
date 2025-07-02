@@ -32,10 +32,25 @@ var corsHeaders = map[string]string{
 var validNtfyPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 type (
-	// Config holds environment variables
+	// Config holds environment variables for multi-user mode
 	Config struct {
 		MongoDBPassword string `envconfig:"MONGODB_PASSWORD" required:"true"`
 		NtfyServer      string `envconfig:"NTFY_SERVER" default:"https://ntfy.sh"`
+	}
+
+	// PersonalConfig holds environment variables for personal mode
+	PersonalConfig struct {
+		ServiceType string `envconfig:"SERVICE_TYPE" default:"Global Entry"`
+		LocationID  string `envconfig:"LOCATION_ID" required:"true"`
+		NtfyTopic   string `envconfig:"NTFY_TOPIC" required:"true"`
+		NtfyServer  string `envconfig:"NTFY_SERVER" default:"https://ntfy.sh"`
+	}
+
+	// AppMode represents the application mode and configuration
+	AppMode struct {
+		IsPersonalMode  bool
+		PersonalConfig  *PersonalConfig
+		MultiUserConfig *Config
 	}
 
 	// Subscription represents a subscription document
@@ -71,7 +86,7 @@ type (
 
 	// LambdaHandler holds dependencies
 	LambdaHandler struct {
-		Config     Config
+		Mode       *AppMode
 		URL        string
 		Client     *mongo.Client
 		HTTPClient *http.Client
@@ -79,9 +94,9 @@ type (
 )
 
 // NewLambdaHandler creates a new LambdaHandler
-func NewLambdaHandler(config Config, url string, client *mongo.Client) *LambdaHandler {
+func NewLambdaHandler(mode *AppMode, url string, client *mongo.Client) *LambdaHandler {
 	return &LambdaHandler{
-		Config: config,
+		Mode:   mode,
 		URL:    url,
 		Client: client,
 		HTTPClient: &http.Client{
@@ -90,11 +105,63 @@ func NewLambdaHandler(config Config, url string, client *mongo.Client) *LambdaHa
 	}
 }
 
+// detectAppMode determines if we're running in personal or multi-user mode
+func detectAppMode() (*AppMode, error) {
+	if os.Getenv("PERSONAL_MODE") == "true" {
+		var personalConfig PersonalConfig
+		if err := envconfig.Process("", &personalConfig); err != nil {
+			return nil, fmt.Errorf("failed to load personal config: %v", err)
+		}
+		return &AppMode{
+			IsPersonalMode: true,
+			PersonalConfig: &personalConfig,
+		}, nil
+	}
+
+	// Multi-user mode
+	var multiUserConfig Config
+	if err := envconfig.Process("", &multiUserConfig); err != nil {
+		return nil, fmt.Errorf("failed to load multi-user config: %v", err)
+	}
+	return &AppMode{
+		IsPersonalMode:  false,
+		MultiUserConfig: &multiUserConfig,
+	}, nil
+}
+
+// getAppointmentURL returns the API URL for checking appointments
+func getAppointmentURL(locationID string) string {
+	return fmt.Sprintf("https://ttp.cbp.dhs.gov/schedulerapi/slots?orderBy=soonest&limit=1&locationId=%s&minimum=1", locationID)
+}
+
+// getNotificationTitle returns service-specific notification title
+func getNotificationTitle(serviceType string) string {
+	return fmt.Sprintf("%s Appointment Notification", serviceType)
+}
+
+// getExpirationTitle returns service-specific expiration title
+func getExpirationTitle(serviceType string) string {
+	return fmt.Sprintf("%s Subscription Expired", serviceType)
+}
+
+// getExpirationMessage returns service-specific expiration message
+func getExpirationMessage(serviceType string) string {
+	return fmt.Sprintf("Your %s appointment subscription has expired.", serviceType)
+}
+
 // checkAvailabilityAndNotify checks appointment availability and notifies topics
-func (h *LambdaHandler) checkAvailabilityAndNotify(ctx context.Context, location string, topics []string) error {
+func (h *LambdaHandler) checkAvailabilityAndNotify(ctx context.Context, serviceType, location string, topics []string) error {
 	// Retry logic for API call
 	for attempt := 1; attempt <= 3; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf(h.URL, location), nil)
+		var apiURL string
+		if h.URL != "" {
+			// Use provided URL (for testing)
+			apiURL = fmt.Sprintf(h.URL, location)
+		} else {
+			// Use real API URL
+			apiURL = getAppointmentURL(location)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 		if err != nil {
 			return fmt.Errorf("failed to create request: %v", err)
 		}
@@ -127,16 +194,23 @@ func (h *LambdaHandler) checkAvailabilityAndNotify(ctx context.Context, location
 
 		if len(appointments) > 0 && appointments[0].Active {
 			for _, topic := range topics {
-				message := fmt.Sprintf("Appointment available at %s on %s", location, appointments[0].StartTimestamp)
+				message := fmt.Sprintf("%s appointment available at %s on %s", serviceType, location, appointments[0].StartTimestamp)
 				payload := map[string]string{
 					"topic":   topic,
 					"message": message,
-					"title":   "Global Entry Appointment Notification",
+					"title":   getNotificationTitle(serviceType),
 				}
 				payloadBytes, _ := json.Marshal(payload)
 
+				var ntfyServer string
+				if h.Mode.IsPersonalMode {
+					ntfyServer = h.Mode.PersonalConfig.NtfyServer
+				} else {
+					ntfyServer = h.Mode.MultiUserConfig.NtfyServer
+				}
+
 				for ntfyAttempt := 1; ntfyAttempt <= 3; ntfyAttempt++ {
-					ntfyReq, err := http.NewRequestWithContext(ctx, http.MethodPost, h.Config.NtfyServer, bytes.NewBuffer(payloadBytes))
+					ntfyReq, err := http.NewRequestWithContext(ctx, http.MethodPost, ntfyServer, bytes.NewBuffer(payloadBytes))
 					if err != nil {
 						return fmt.Errorf("failed to create ntfy request: %v", err)
 					}
@@ -165,8 +239,12 @@ func (h *LambdaHandler) checkAvailabilityAndNotify(ctx context.Context, location
 	return nil
 }
 
-// handleExpiringSubscriptions deletes subscriptions exactly 30 days old and notifies
+// handleExpiringSubscriptions deletes subscriptions exactly 30 days old and notifies (multi-user mode only)
 func (h *LambdaHandler) handleExpiringSubscriptions(ctx context.Context, coll *mongo.Collection) error {
+	if h.Mode.IsPersonalMode {
+		// Personal mode doesn't have expiring subscriptions
+		return nil
+	}
 	now := time.Now().UTC()
 	// Calculate the 5-minute window for subscriptions exactly 30 days old
 	ttlThreshold := now.Add(-30 * 24 * time.Hour)         // 30 days ago
@@ -192,16 +270,16 @@ func (h *LambdaHandler) handleExpiringSubscriptions(ctx context.Context, coll *m
 
 	for _, sub := range subscriptions {
 		// Send expiration notification
-		message := "Your Global Entry appointment subscription has expired."
+		message := getExpirationMessage("Global Entry")
 		payload := map[string]string{
 			"topic":   sub.NtfyTopic,
 			"message": message,
-			"title":   "Global Entry Subscription Expired",
+			"title":   getExpirationTitle("Global Entry"),
 		}
 		payloadBytes, _ := json.Marshal(payload)
 
 		for attempt := 1; attempt <= 3; attempt++ {
-			req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.Config.NtfyServer, bytes.NewBuffer(payloadBytes))
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, h.Mode.MultiUserConfig.NtfyServer, bytes.NewBuffer(payloadBytes))
 			if err != nil {
 				return fmt.Errorf("failed to create ntfy request: %v", err)
 			}
@@ -313,8 +391,27 @@ func (h *LambdaHandler) handleSubscription(ctx context.Context, coll *mongo.Coll
 	}
 }
 
-// HandleRequest handles Scheduled Events and API requests
-func (h *LambdaHandler) HandleRequest(ctx context.Context, event json.RawMessage) (events.APIGatewayV2HTTPResponse, error) {
+// handlePersonalMode handles CloudWatch events in personal mode
+func (h *LambdaHandler) handlePersonalMode(ctx context.Context) (events.APIGatewayV2HTTPResponse, error) {
+	config := h.Mode.PersonalConfig
+	topics := []string{config.NtfyTopic}
+
+	if err := h.checkAvailabilityAndNotify(ctx, config.ServiceType, config.LocationID, topics); err != nil {
+		slog.Error("Failed to check availability in personal mode", "location", config.LocationID, "error", err)
+		return events.APIGatewayV2HTTPResponse{
+				StatusCode: 500,
+				Body:       `{"error": "failed to check availability"}`},
+			nil
+	}
+
+	return events.APIGatewayV2HTTPResponse{
+			StatusCode: 200,
+			Body:       `{"message": "personal mode check completed"}`},
+		nil
+}
+
+// handleMultiUserMode handles events in multi-user mode (original functionality)
+func (h *LambdaHandler) handleMultiUserMode(ctx context.Context, event json.RawMessage) (events.APIGatewayV2HTTPResponse, error) {
 	coll := h.Client.Database("global-entry-appointment-db").Collection("subscriptions")
 
 	// Parse event as JSON map
@@ -384,7 +481,7 @@ func (h *LambdaHandler) HandleRequest(ctx context.Context, event json.RawMessage
 				defer wg.Done()
 				semaphore <- struct{}{}
 				defer func() { <-semaphore }()
-				if err := h.checkAvailabilityAndNotify(ctx, lt.Location, lt.NtfyTopics); err != nil {
+				if err := h.checkAvailabilityAndNotify(ctx, "Global Entry", lt.Location, lt.NtfyTopics); err != nil {
 					slog.Error("Failed to check availability", "location", lt.Location, "error", err)
 				}
 			}(lt)
@@ -482,25 +579,55 @@ func (h *LambdaHandler) HandleRequest(ctx context.Context, event json.RawMessage
 	}, nil
 }
 
+// HandleRequest handles Scheduled Events and API requests - unified entry point
+func (h *LambdaHandler) HandleRequest(ctx context.Context, event json.RawMessage) (events.APIGatewayV2HTTPResponse, error) {
+	if h.Mode.IsPersonalMode {
+		// Personal mode only handles CloudWatch events
+		var eventMap map[string]interface{}
+		if err := json.Unmarshal(event, &eventMap); err == nil {
+			if source, ok := eventMap["source"].(string); ok && source == "aws.events" {
+				return h.handlePersonalMode(ctx)
+			}
+		}
+		// Personal mode doesn't handle API requests
+		return events.APIGatewayV2HTTPResponse{
+				StatusCode: 400,
+				Body:       `{"error": "personal mode only handles scheduled events"}`},
+			nil
+	}
+
+	// Multi-user mode handles all events
+	return h.handleMultiUserMode(ctx, event)
+}
+
 func main() {
-	var config Config
-	if err := envconfig.Process("", &config); err != nil {
-		panic(fmt.Sprintf("failed to load config: %v", err))
-	}
-
-	url := "https://ttp.cbp.dhs.gov/schedulerapi/slots?orderBy=soonest&limit=1&locationId=%s&minimum=1"
-	dbURL := "mongodb+srv://arun0009:%s@global-entry-appointmen.fcwlj2v.mongodb.net/?retryWrites=true&w=majority&appName=global-entry-appointment-cluster"
-	serverAPI := options.ServerAPI(options.ServerAPIVersion1)
-	opts := options.Client().ApplyURI(fmt.Sprintf(dbURL, config.MongoDBPassword)).SetServerAPIOptions(serverAPI).SetConnectTimeout(10 * time.Second)
-	client, err := mongo.Connect(opts)
-	if err != nil {
-		panic(fmt.Sprintf("failed to connect to MongoDB: %v", err))
-	}
-	defer client.Disconnect(context.Background())
-
 	// Initialize structured logging
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
-	handler := NewLambdaHandler(config, url, client)
+	// Detect application mode
+	mode, err := detectAppMode()
+	if err != nil {
+		panic(fmt.Sprintf("failed to detect app mode: %v", err))
+	}
+
+	var client *mongo.Client
+	if !mode.IsPersonalMode {
+		// Only connect to MongoDB in multi-user mode
+		dbURL := "mongodb+srv://arun0009:%s@global-entry-appointmen.fcwlj2v.mongodb.net/?retryWrites=true&w=majority&appName=global-entry-appointment-cluster"
+		serverAPI := options.ServerAPI(options.ServerAPIVersion1)
+		opts := options.Client().ApplyURI(fmt.Sprintf(dbURL, mode.MultiUserConfig.MongoDBPassword)).SetServerAPIOptions(serverAPI).SetConnectTimeout(10 * time.Second)
+		client, err = mongo.Connect(opts)
+		if err != nil {
+			panic(fmt.Sprintf("failed to connect to MongoDB: %v", err))
+		}
+		defer client.Disconnect(context.Background())
+		slog.Info("Connected to MongoDB for multi-user mode")
+	} else {
+		slog.Info("Running in personal mode - no database connection needed")
+	}
+
+	// URL is empty for production (will use real API), set for testing
+	url := ""
+	handler := NewLambdaHandler(mode, url, client)
 	lambda.Start(handler.HandleRequest)
 }
